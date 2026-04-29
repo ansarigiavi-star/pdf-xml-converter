@@ -170,7 +170,7 @@ HTML = r"""<!DOCTYPE html>
   <div class="subtitle">batch converter · runs locally · no data leaves your machine</div>
 </header>
 <main>
-  <div id="dropzone" onclick="document.getElementById('file-input').click()">
+  <div id="dropzone">
     <span class="drop-icon">📄</span>
     <div class="drop-label">Drop PDF files here</div>
     <div class="drop-sub">or click to browse &nbsp;·&nbsp; multiple files supported</div>
@@ -253,10 +253,32 @@ function renderQueue() {
   updateStatus();
 }
 
-dropzone.addEventListener('dragover', e => { e.preventDefault(); dropzone.classList.add('drag-over'); });
-dropzone.addEventListener('dragleave', () => dropzone.classList.remove('drag-over'));
-dropzone.addEventListener('drop', e => { e.preventDefault(); dropzone.classList.remove('drag-over'); addFiles([...e.dataTransfer.files]); });
-fileInput.addEventListener('change', () => { addFiles([...fileInput.files]); fileInput.value=''; });
+// Prevent browser from opening dropped files globally
+document.addEventListener('dragover', e => e.preventDefault());
+document.addEventListener('drop', e => e.preventDefault());
+
+// Dropzone — highlight on drag enter/over
+dropzone.addEventListener('dragenter', e => { e.preventDefault(); e.stopPropagation(); dropzone.classList.add('drag-over'); });
+dropzone.addEventListener('dragover',  e => { e.preventDefault(); e.stopPropagation(); dropzone.classList.add('drag-over'); });
+dropzone.addEventListener('dragleave', e => { e.stopPropagation(); dropzone.classList.remove('drag-over'); });
+dropzone.addEventListener('drop', e => {
+  e.preventDefault();
+  e.stopPropagation();
+  dropzone.classList.remove('drag-over');
+  const dropped = [...e.dataTransfer.files];
+  log(`Dropped ${dropped.length} file(s)`, 'info');
+  addFiles(dropped);
+});
+
+// Click to browse — only trigger when clicking the dropzone itself, not child elements
+dropzone.addEventListener('click', e => {
+  fileInput.click();
+});
+
+fileInput.addEventListener('change', () => {
+  addFiles([...fileInput.files]);
+  fileInput.value = '';
+});
 
 function addFiles(newFiles) {
   newFiles.filter(f => f.name.toLowerCase().endsWith('.pdf')).forEach(f => {
