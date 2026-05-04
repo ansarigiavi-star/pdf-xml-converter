@@ -1,85 +1,298 @@
 """
-PDF → XML Converter — Web App (Railway / Render compatible)
+PDF → IATA IS-XML Converter — Web App (Railway)
+Converts ground handler invoices (PDF) to IATA IS-XML format
+(IS-XML Invoice Standard V3.4, Charge Category: Ground Handling)
 """
 
 import io
 import os
+import re
 import xml.etree.ElementTree as ET
+from datetime import datetime
 from xml.dom import minidom
 
 import pdfplumber
 from flask import Flask, jsonify, render_template_string, request
 
 app = Flask(__name__)
-app.config["MAX_CONTENT_LENGTH"] = 100 * 1024 * 1024  # 100 MB max batch
+app.config["MAX_CONTENT_LENGTH"] = 100 * 1024 * 1024
 
 
-# ── Converter logic ──────────────────────────────────────────────────────────
+# ── PDF field extraction ─────────────────────────────────────────────────────
 
-def pdf_bytes_to_xml(pdf_bytes: bytes, filename: str) -> str:
-    root = ET.Element("document")
-    root.set("source", filename)
-
+def extract_invoice_fields(pdf_bytes: bytes) -> dict:
+    """
+    Extract structured fields from a ground handler invoice PDF.
+    Returns a dict of all detected fields.
+    """
     with pdfplumber.open(io.BytesIO(pdf_bytes)) as pdf:
-        meta_el = ET.SubElement(root, "metadata")
-        for k, v in (pdf.metadata or {}).items():
-            m = ET.SubElement(meta_el, "meta", name=str(k))
-            m.text = str(v)
+        full_text = "\n".join(
+            page.extract_text(x_tolerance=3, y_tolerance=3) or ""
+            for page in pdf.pages
+        )
 
-        for page_num, page in enumerate(pdf.pages, start=1):
-            page_el = ET.SubElement(
-                root, "page",
-                number=str(page_num),
-                width=str(round(page.width, 2)),
-                height=str(round(page.height, 2)),
-            )
+    lines = [l.strip() for l in full_text.splitlines() if l.strip()]
+    text = "\n".join(lines)
 
-            tables = page.find_tables()
-            table_bboxes = []
+    def find(patterns, default=""):
+        for pat in patterns:
+            m = re.search(pat, text, re.IGNORECASE)
+            if m:
+                return m.group(1).strip()
+        return default
 
-            for t_idx, tobj in enumerate(tables):
-                table_el = ET.SubElement(page_el, "table", index=str(t_idx))
-                table_bboxes.append(tobj.bbox)
-                for r_idx, row in enumerate(tobj.extract()):
-                    row_el = ET.SubElement(table_el, "row", index=str(r_idx))
-                    for c_idx, cell in enumerate(row):
-                        cell_el = ET.SubElement(row_el, "cell", col=str(c_idx))
-                        cell_el.text = (cell or "").strip()
+    # ── Seller (ground handler / supplier) ──────────────────────────────────
+    seller_name    = find([r'^([A-Z][^\n]{2,40}(?:Ltd|LLC|Inc|GmbH|SA|SAS|BV|NV|Handling|Services)[^\n]*)', r'(?:from|supplier)[:\s]+([^\n]+)'])
+    seller_address = find([r'((?:Unit|Floor|Suite|No\.?)\s*\d[^\n]*)'])
+    seller_email   = find([r'[Ee]mail[:\s]+([^\s]+@[^\s]+)'])
+    seller_tel     = find([r'[Tt]el[:\s]+([\d\s\+\-\(\)]{7,20})'])
+    seller_vat     = find([r'VAT\s+(?:Registration\s+)?(?:Number|No\.?)[:\s]+([\w\s]+?)(?:\s+Company|\s*$)', r'VAT[:\s#]+([\w\s]+?)(?:\s+Company|\s*$)'])
+    seller_reg     = find([r'Company\s+Registration\s+(?:Number|No\.?)[:\s]+([\w\s]+?)(?:\s*$)', r'Reg(?:istration)?[:\s#No\.]+([\w]+)'])
+    seller_iban    = find([r'IBAN[:\s]+([\w]+)'])
+    seller_swift   = find([r'SWIFT\s*(?:CODE\s*(?:\([^)]+\))?\s*IS\s+|[:\s]+)([\w]+)'])
+    seller_bank    = find([r'((?:Natwest|Barclays|HSBC|Lloyds|BNP|Deutsche|UniCredit)[^\n]*)'])
+    seller_acc_no  = find([r'Acc(?:ount)?\s+Number[:\s]+([\d]+)'])
+    seller_sort    = find([r'Sort\s+Code[:\s]+([\d\-]+)'])
 
-            cropped = page
-            for bbox in table_bboxes:
-                try:
-                    cropped = cropped.filter(
-                        lambda obj, b=bbox: not (
-                            obj.get("x0", 0) >= b[0]
-                            and obj.get("top", 0) >= b[1]
-                            and obj.get("x1", 0) <= b[2]
-                            and obj.get("bottom", 0) <= b[3]
-                        )
-                    )
-                except Exception:
-                    pass
+    # ── Buyer (airline) ─────────────────────────────────────────────────────
+    buyer_name     = find([r'(?:Client|Bill(?:ed)?\s+To|To)[:\s]*\n([^\n]+)', r'(Aegean Airlines[^\n]*)'])
+    buyer_iata     = find([r'\b(A3|[A-Z]{2})\s*[-–]\s*([A-Z][a-z]+)', r'([A-Z]{2})\s*-\s*Aegean'])
+    buyer_location = find([r'(?:Room|Office|Terminal)[^\n]+\n([^\n]+Airport[^\n]*)'])
 
-            txt = cropped.extract_text(x_tolerance=3, y_tolerance=3)
-            if txt and txt.strip():
-                text_el = ET.SubElement(page_el, "text")
-                for line in txt.splitlines():
-                    line = line.strip()
-                    if line:
-                        ET.SubElement(text_el, "line").text = line
+    # ── Invoice header ───────────────────────────────────────────────────────
+    inv_number  = find([r'Invoice\s+No[:\s.]*(\d+)', r'Invoice\s+#[:\s]*(\d+)', r'Inv(?:oice)?[#No\.\s]+(\d+)'])
+    inv_date    = find([r'Invoice\s+Date[:\s]+([\d]{1,2}[/\-\.]\d{1,2}[/\-\.]\d{2,4})', r'Date[:\s]+([\d]{1,2}[/\-]\d{1,2}[/\-]\d{4})'])
+    pay_terms   = find([r'Payment\s+Terms[:\s]+(\d+)\s+days', r'(\d+)\s+days?\s+from'])
+    currency    = find([r'\b(GBP|EUR|USD|CHF|AED|SAR)\b'], 'GBP')
 
-    raw = ET.tostring(root, encoding="unicode")
-    return minidom.parseString(raw).toprettyxml(indent="  ")
+    # ── Line items / station costs ───────────────────────────────────────────
+    # Extract station + cost pairs  e.g. "LHR - HEATHROW  911.26"
+    station_lines = re.findall(r'([A-Z]{3})\s*[-–]\s*([A-Z\s]+?)\s+([\d,]+\.?\d*)\s*$', text, re.MULTILINE)
+
+    # ── Totals ───────────────────────────────────────────────────────────────
+    total_ex_vat = find([r'Total\s+Ex\s+Vat[^\d]*([\d,]+\.?\d*)', r'Subtotal[^\d]*([\d,]+\.?\d*)'])
+    total_vat    = find([r'Total\s+VAT[^\d]*([\d,]+\.?\d*)', r'VAT\s+Amount[^\d]*([\d,]+\.?\d*)'])
+    total_gross  = find([r'Total\s+Invoice\s+Cost[^\d]*([\d,]+\.?\d*)', r'Total\s+(?:Amount\s+)?Due[^\d]*([\d,]+\.?\d*)', r'TOTAL[^\d]*([\d,]+\.?\d*)'])
+    vat_rate     = find([r'@\s*([\d.]+)\s*%', r'VAT\s+@\s*([\d.]+)\s*%'], '0')
+
+    # ── Service / charge code detection ─────────────────────────────────────
+    charge_code = "Misc"
+    charge_map = {
+        "Mishandling Baggage":  ["mishandl", "damaged bag", "bag repair", "bag replac"],
+        "Baggage":              ["baggage handl", "bag handl", "loading", "unloading"],
+        "Baggage Delivery":     ["bag deliver", "baggage deliver"],
+        "Ramp Handling":        ["ramp handl", "ramp service"],
+        "Passenger Handling":   ["passenger handl", "pax handl"],
+        "Catering":             ["catering", "meal", "inflight"],
+        "Cleaning":             ["cleaning", "cabin clean"],
+        "Deicing":              ["de-ic", "deic", "anti-ic"],
+        "Cargo Handling":       ["cargo handl"],
+        "Crew Accommodation":   ["crew hotel", "crew accommod"],
+        "Crew Transportation":  ["crew transport", "crew shuttle"],
+    }
+    tl = text.lower()
+    for code, keywords in charge_map.items():
+        if any(kw in tl for kw in keywords):
+            charge_code = code
+            break
+
+    # Parse invoice date into ISO format
+    inv_date_iso = ""
+    if inv_date:
+        for fmt in ("%d/%m/%Y", "%m/%d/%Y", "%d-%m-%Y", "%d.%m.%Y", "%d/%m/%y"):
+            try:
+                inv_date_iso = datetime.strptime(inv_date, fmt).strftime("%Y-%m-%d")
+                break
+            except ValueError:
+                continue
+    if not inv_date_iso:
+        inv_date_iso = datetime.today().strftime("%Y-%m-%d")
+
+    return {
+        "seller_name":    seller_name    or "Unknown Supplier",
+        "seller_address": seller_address or "",
+        "seller_email":   seller_email   or "",
+        "seller_tel":     seller_tel     or "",
+        "seller_vat":     seller_vat     or "",
+        "seller_reg":     seller_reg     or "",
+        "seller_iban":    seller_iban    or "",
+        "seller_swift":   seller_swift   or "",
+        "seller_bank":    seller_bank    or "",
+        "seller_acc_no":  seller_acc_no  or "",
+        "seller_sort":    seller_sort    or "",
+        "buyer_name":     buyer_name     or "Unknown Airline",
+        "buyer_iata":     buyer_iata     or "",
+        "buyer_location": buyer_location or "",
+        "inv_number":     inv_number     or "UNKNOWN",
+        "inv_date":       inv_date_iso,
+        "pay_terms":      pay_terms      or "30",
+        "currency":       currency,
+        "charge_code":    charge_code,
+        "station_lines":  station_lines,  # list of (iata, name, amount)
+        "total_ex_vat":   total_ex_vat   or "0.00",
+        "total_vat":      total_vat      or "0.00",
+        "total_gross":    total_gross    or "0.00",
+        "vat_rate":       vat_rate,
+        "raw_text":       text,
+    }
 
 
-# ── Routes ───────────────────────────────────────────────────────────────────
+# ── IATA IS-XML builder ──────────────────────────────────────────────────────
+
+def build_iata_xml(fields: dict, filename: str) -> str:
+    """
+    Build IATA IS-XML (Invoice Standard V3.4) from extracted fields.
+    Structure: Transmission > Invoice > InvoiceHeader + LineItem(s) + InvoiceSummary
+    """
+    ns = "http://www.iata.org/IATA/2007/00"
+    ET.register_namespace("", ns)
+
+    def el(parent, tag, text=None, **attrs):
+        e = ET.SubElement(parent, tag, **attrs)
+        if text is not None:
+            e.text = str(text)
+        return e
+
+    # ── Root: Transmission ───────────────────────────────────────────────────
+    transmission = ET.Element("Transmission", xmlns=ns)
+
+    # TransmissionHeader
+    th = el(transmission, "TransmissionHeader")
+    el(th, "TransmissionDate", datetime.utcnow().strftime("%Y-%m-%dT%H:%M:%SZ"))
+    el(th, "Version", "3.4")
+    el(th, "BillingCategory", "Miscellaneous")
+
+    # ── Invoice ──────────────────────────────────────────────────────────────
+    invoice = el(transmission, "Invoice")
+
+    # InvoiceHeader
+    ih = el(invoice, "InvoiceHeader")
+    el(ih, "InvoiceNumber",  fields["inv_number"])
+    el(ih, "InvoiceDate",    fields["inv_date"])
+    el(ih, "InvoiceType",    "Original")
+    el(ih, "ChargeCategory", "Ground Handling")
+
+    # SellerOrganization
+    seller = el(ih, "SellerOrganization")
+    el(seller, "OrganizationID", fields["seller_name"])
+    if fields["seller_vat"]:
+        el(seller, "VATNumber", fields["seller_vat"].strip())
+    if fields["seller_reg"]:
+        el(seller, "RegistrationNumber", fields["seller_reg"].strip())
+    if fields["seller_address"]:
+        el(seller, "Address", fields["seller_address"])
+    if fields["seller_tel"]:
+        cd = el(seller, "ContactDetails")
+        el(cd, "ContactType",  "Phone")
+        el(cd, "ContactValue", fields["seller_tel"].strip())
+    if fields["seller_email"]:
+        cd = el(seller, "ContactDetails")
+        el(cd, "ContactType",  "Email")
+        el(cd, "ContactValue", fields["seller_email"])
+
+    # BankDetails (TPA_Extension — standard allows this)
+    if fields["seller_iban"] or fields["seller_swift"]:
+        bank = el(seller, "BankDetails")
+        if fields["seller_bank"]:
+            el(bank, "BankName",      fields["seller_bank"])
+        if fields["seller_acc_no"]:
+            el(bank, "AccountNumber", fields["seller_acc_no"])
+        if fields["seller_sort"]:
+            el(bank, "SortCode",      fields["seller_sort"])
+        if fields["seller_iban"]:
+            el(bank, "IBAN",          fields["seller_iban"])
+        if fields["seller_swift"]:
+            el(bank, "SWIFTCode",     fields["seller_swift"])
+
+    # BuyerOrganization
+    buyer = el(ih, "BuyerOrganization")
+    el(buyer, "OrganizationID", fields["buyer_name"])
+    if fields["buyer_iata"]:
+        el(buyer, "IATACode", fields["buyer_iata"])
+    if fields["buyer_location"]:
+        el(buyer, "LocationID", fields["buyer_location"])
+
+    # PaymentTerms
+    pt = el(ih, "PaymentTerms")
+    el(pt, "CurrencyCode",     fields["currency"])
+    el(pt, "SettlementMethod", "IS")
+    el(pt, "PaymentDays",      fields["pay_terms"])
+
+    # ISDetails
+    isd = el(ih, "ISDetails")
+    el(isd, "DigitalSignatureFlag", "false")
+
+    # ── LineItems ────────────────────────────────────────────────────────────
+    station_lines = fields["station_lines"]
+
+    # If we found station lines use them; else one generic line
+    if not station_lines:
+        station_lines = [("", "", fields["total_ex_vat"])]
+
+    for idx, (iata_code, station_name, amount) in enumerate(station_lines, start=1):
+        li = el(invoice, "LineItem")
+        el(li, "LineItemNumber", str(idx))
+        el(li, "ChargeCode",     fields["charge_code"])
+        desc = f"{fields['charge_code']} – {iata_code} {station_name}".strip(" –")
+        el(li, "Description",    desc or fields["charge_code"])
+
+        if iata_code:
+            el(li, "LocationCode", iata_code)
+
+        el(li, "StartDate", fields["inv_date"])
+        el(li, "EndDate",   fields["inv_date"])
+
+        qty = el(li, "Quantity", "1")
+        qty.set("UOMCode", "EA")
+
+        amt_clean = amount.replace(",", "")
+        unit = el(li, "UnitPrice", amt_clean)
+        unit.set("SF", fields["currency"])
+
+        charge = el(li, "ChargeAmount", amt_clean)
+        charge.set("Name", "NetAmount")
+
+        el(li, "TotalNetAmount", amt_clean)
+
+        # VAT line
+        if fields["vat_rate"] and float(fields["vat_rate"]) > 0:
+            tax = el(li, "TaxInformation")
+            el(tax, "TaxCategory", "Standard")
+            el(tax, "TaxRate",     fields["vat_rate"])
+            try:
+                vat_amt = round(float(amt_clean) * float(fields["vat_rate"]) / 100, 2)
+                el(tax, "TaxAmount", f"{vat_amt:.2f}")
+            except ValueError:
+                pass
+
+    # ── InvoiceSummary ───────────────────────────────────────────────────────
+    summary = el(invoice, "InvoiceSummary")
+    el(summary, "LineItemCount",      str(len(station_lines)))
+    el(summary, "TotalLineItemAmount", fields["total_ex_vat"].replace(",", ""))
+    el(summary, "TotalVATAmount",      fields["total_vat"].replace(",", ""))
+    el(summary, "TotalAmount",         fields["total_gross"].replace(",", ""))
+    el(summary, "CurrencyCode",        fields["currency"])
+
+    # ── TransmissionSummary ──────────────────────────────────────────────────
+    ts = el(transmission, "TransmissionSummary")
+    el(ts, "InvoiceCount", "1")
+    total_el = el(ts, "TotalAmount", fields["total_gross"].replace(",", ""))
+    total_el.set("CurrencyCode", fields["currency"])
+
+    # Pretty print
+    raw = ET.tostring(transmission, encoding="unicode", xml_declaration=False)
+    pretty = minidom.parseString(raw).toprettyxml(indent="  ")
+    return pretty
+
+
+# ── Flask routes ─────────────────────────────────────────────────────────────
 
 HTML = r"""<!DOCTYPE html>
 <html lang="en">
 <head>
 <meta charset="UTF-8">
 <meta name="viewport" content="width=device-width, initial-scale=1.0">
-<title>PDF → XML Converter</title>
+<title>PDF → IATA IS-XML</title>
 <style>
   @import url('https://fonts.googleapis.com/css2?family=IBM+Plex+Mono:wght@400;600&family=IBM+Plex+Sans:wght@300;400;600&display=swap');
   *, *::before, *::after { box-sizing: border-box; margin: 0; padding: 0; }
@@ -88,97 +301,88 @@ HTML = r"""<!DOCTYPE html>
     --accent: #00e5a0; --accent-dim: #00e5a018;
     --text: #e8e8e8; --muted: #666; --danger: #ff4d4d; --warn: #f5a623;
   }
-  body {
-    background: var(--bg); color: var(--text);
+  body { background: var(--bg); color: var(--text);
     font-family: 'IBM Plex Sans', sans-serif;
     min-height: 100vh; display: flex; flex-direction: column;
-    align-items: center; padding: 48px 24px 80px;
-  }
-  header { width: 100%; max-width: 780px; margin-bottom: 48px;
+    align-items: center; padding: 48px 24px 80px; }
+  header { width: 100%; max-width: 820px; margin-bottom: 40px;
     border-bottom: 1px solid var(--border); padding-bottom: 24px; }
   .logo { font-family: 'IBM Plex Mono', monospace; font-size: 11px;
-    letter-spacing: 0.25em; color: var(--accent); text-transform: uppercase; margin-bottom: 12px; }
-  h1 { font-size: 32px; font-weight: 300; letter-spacing: -0.02em; }
+    letter-spacing: 0.25em; color: var(--accent); text-transform: uppercase; margin-bottom: 10px; }
+  h1 { font-size: 28px; font-weight: 300; letter-spacing: -0.02em; }
   h1 span { color: var(--accent); font-weight: 600; }
-  .subtitle { font-size: 12px; color: var(--muted); margin-top: 8px;
-    font-family: 'IBM Plex Mono', monospace; }
-  main { width: 100%; max-width: 780px; }
-  #dropzone {
-    border: 1px dashed var(--border); background: var(--surface);
+  .badge { display: inline-block; background: var(--accent-dim); border: 1px solid var(--accent);
+    color: var(--accent); font-family: 'IBM Plex Mono', monospace; font-size: 10px;
+    padding: 2px 8px; letter-spacing: 0.1em; margin-top: 8px; }
+  .subtitle { font-size: 11px; color: var(--muted); margin-top: 8px; font-family: 'IBM Plex Mono', monospace; }
+  main { width: 100%; max-width: 820px; }
+  #dropzone { border: 1px dashed var(--border); background: var(--surface);
     padding: 52px 32px; text-align: center; cursor: pointer;
-    transition: border-color 0.2s, background 0.2s; margin-bottom: 24px;
-  }
+    transition: border-color 0.2s, background 0.2s; margin-bottom: 20px; }
   #dropzone.drag-over { border-color: var(--accent); background: var(--accent-dim); }
-  .drop-icon { font-size: 40px; margin-bottom: 16px; display: block; }
-  .drop-label { font-size: 16px; font-weight: 600; margin-bottom: 6px; }
-  .drop-sub { font-size: 12px; color: var(--muted); font-family: 'IBM Plex Mono', monospace; }
+  .drop-icon { font-size: 36px; margin-bottom: 14px; display: block; }
+  .drop-label { font-size: 15px; font-weight: 600; margin-bottom: 6px; }
+  .drop-sub { font-size: 11px; color: var(--muted); font-family: 'IBM Plex Mono', monospace; }
   #file-input { display: none; }
-  #queue { display: flex; flex-direction: column; gap: 8px; margin-bottom: 24px; }
-  .file-row {
-    background: var(--surface); border: 1px solid var(--border);
+  #queue { display: flex; flex-direction: column; gap: 8px; margin-bottom: 20px; }
+  .file-row { background: var(--surface); border: 1px solid var(--border);
     border-left: 3px solid var(--border);
-    padding: 12px 16px; display: flex; align-items: center; gap: 12px;
-    font-family: 'IBM Plex Mono', monospace; font-size: 12px;
-  }
+    padding: 10px 14px; display: flex; align-items: center; gap: 10px;
+    font-family: 'IBM Plex Mono', monospace; font-size: 11px; }
   .file-row.done { border-left-color: var(--accent); }
   .file-row.error { border-left-color: var(--danger); }
   .file-row.processing { border-left-color: var(--warn); }
   .file-name { flex: 1; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
-  .file-size { color: var(--muted); flex-shrink: 0; }
-  .file-status { flex-shrink: 0; font-size: 11px; min-width: 80px; text-align: right; }
-  .file-status.ok { color: var(--accent); }
-  .file-status.err { color: var(--danger); }
-  .file-status.proc { color: var(--warn); }
-  .dl-btn {
-    background: var(--accent); color: #000; border: none;
-    padding: 5px 14px; font-family: 'IBM Plex Mono', monospace;
-    font-size: 11px; font-weight: 600; cursor: pointer; flex-shrink: 0;
-  }
+  .file-meta { color: var(--muted); flex-shrink: 0; font-size: 10px; }
+  .file-status { flex-shrink: 0; font-size: 10px; min-width: 88px; text-align: right; }
+  .file-status.ok { color: var(--accent); } .file-status.err { color: var(--danger); } .file-status.proc { color: var(--warn); }
+  .dl-btn { background: var(--accent); color: #000; border: none;
+    padding: 4px 12px; font-family: 'IBM Plex Mono', monospace;
+    font-size: 10px; font-weight: 600; cursor: pointer; flex-shrink: 0; }
   .dl-btn:hover { background: #00ffb3; }
-  .rm-btn {
-    background: transparent; color: var(--muted); border: none;
-    font-size: 14px; cursor: pointer; flex-shrink: 0; padding: 0 4px;
-  }
+  .rm-btn { background: transparent; color: var(--muted); border: none;
+    font-size: 13px; cursor: pointer; flex-shrink: 0; }
   .rm-btn:hover { color: var(--danger); }
-  .actions { display: flex; gap: 12px; margin-bottom: 28px; flex-wrap: wrap; }
-  .btn { padding: 12px 28px; font-family: 'IBM Plex Mono', monospace;
-    font-size: 12px; font-weight: 600; letter-spacing: 0.08em;
+  .actions { display: flex; gap: 10px; margin-bottom: 24px; flex-wrap: wrap; }
+  .btn { padding: 11px 26px; font-family: 'IBM Plex Mono', monospace;
+    font-size: 11px; font-weight: 600; letter-spacing: 0.08em;
     text-transform: uppercase; border: none; cursor: pointer; }
   .btn-primary { background: var(--accent); color: #000; }
   .btn-primary:hover { background: #00ffb3; }
   .btn-primary:disabled { background: #2a2a2a; color: #444; cursor: not-allowed; }
   .btn-ghost { background: transparent; color: var(--muted); border: 1px solid var(--border); }
   .btn-ghost:hover { color: var(--text); border-color: #555; }
-  .log-label { font-family: 'IBM Plex Mono', monospace; font-size: 10px;
-    letter-spacing: 0.15em; color: var(--muted); text-transform: uppercase; margin-bottom: 8px; }
-  #log { background: var(--surface); border: 1px solid var(--border);
-    padding: 16px; font-family: 'IBM Plex Mono', monospace; font-size: 11px;
-    color: var(--muted); max-height: 180px; overflow-y: auto; line-height: 2; }
-  .log-ok { color: var(--accent); }
-  .log-err { color: var(--danger); }
-  .log-info { color: var(--warn); }
-  .progress-bar-wrap { height: 2px; background: var(--border); margin-bottom: 24px; }
+  .progress-bar-wrap { height: 2px; background: var(--border); margin-bottom: 20px; }
   .progress-bar { height: 2px; background: var(--accent); width: 0%; transition: width 0.3s; }
-  .status-line { font-family: 'IBM Plex Mono', monospace; font-size: 11px;
-    color: var(--muted); margin-bottom: 24px; }
+  .status-line { font-family: 'IBM Plex Mono', monospace; font-size: 11px; color: var(--muted); margin-bottom: 20px; }
+  .log-label { font-family: 'IBM Plex Mono', monospace; font-size: 10px;
+    letter-spacing: 0.15em; color: var(--muted); text-transform: uppercase; margin-bottom: 6px; }
+  #log { background: var(--surface); border: 1px solid var(--border);
+    padding: 14px; font-family: 'IBM Plex Mono', monospace; font-size: 11px;
+    color: var(--muted); max-height: 200px; overflow-y: auto; line-height: 1.9; }
+  .log-ok { color: var(--accent); } .log-err { color: var(--danger); } .log-info { color: var(--warn); }
+  .schema-note { margin-top: 20px; padding: 14px 16px; background: var(--surface);
+    border: 1px solid var(--border); border-left: 3px solid var(--accent);
+    font-family: 'IBM Plex Mono', monospace; font-size: 10px; color: var(--muted); line-height: 1.8; }
+  .schema-note strong { color: var(--accent); }
 </style>
 </head>
 <body>
 <header>
-  <div class="logo">Ground Ops Tooling · Local</div>
-  <h1>PDF <span>→</span> XML</h1>
-  <div class="subtitle">batch converter · runs locally · no data leaves your machine</div>
+  <div class="logo">Aegean Airlines · Ground Ops Tooling</div>
+  <h1>PDF <span>→</span> IATA IS-XML</h1>
+  <div class="badge">IS-XML Invoice Standard V3.4 · Ground Handling</div>
+  <div class="subtitle">batch converter · 100% offline · no internet required</div>
 </header>
 <main>
   <div id="dropzone">
     <span class="drop-icon">📄</span>
-    <div class="drop-label">Drop PDF files here</div>
-    <div class="drop-sub">or click to browse &nbsp;·&nbsp; multiple files supported</div>
+    <div class="drop-label">Drop ground handler invoice PDFs here</div>
+    <div class="drop-sub">or click to browse · multiple files supported</div>
     <input type="file" id="file-input" accept=".pdf" multiple>
   </div>
 
   <div id="queue"></div>
-
   <div class="progress-bar-wrap"><div class="progress-bar" id="progress"></div></div>
   <div class="status-line" id="status-line">No files loaded.</div>
 
@@ -189,15 +393,21 @@ HTML = r"""<!DOCTYPE html>
   </div>
 
   <div class="log-label">Console</div>
-  <div id="log"><span class="log-info">Ready. Add PDF files to begin.</span></div>
+  <div id="log"><span class="log-info">Ready — drop PDFs to begin.</span></div>
+
+  <div class="schema-note">
+    <strong>Output schema:</strong> IATA IS-XML V3.4 &nbsp;·&nbsp;
+    <strong>Charge Category:</strong> Ground Handling &nbsp;·&nbsp;
+    <strong>Charge Codes detected:</strong> Mishandling Baggage, Baggage, Ramp Handling, Catering, Cleaning, Deicing + more<br>
+    Fields extracted: InvoiceNumber · InvoiceDate · Seller/Buyer · LocationCode (IATA) · LineItems · VAT · Totals · Bank/IBAN/SWIFT
+  </div>
 </main>
 
 <script>
-const files = [];  // {file, name, size, status, xmlBlob}
-
-const dropzone = document.getElementById('dropzone');
-const fileInput = document.getElementById('file-input');
-const queueEl  = document.getElementById('queue');
+const files = [];
+const dropzone   = document.getElementById('dropzone');
+const fileInput  = document.getElementById('file-input');
+const queueEl    = document.getElementById('queue');
 const convertBtn = document.getElementById('convert-btn');
 const dlAllBtn   = document.getElementById('dl-all-btn');
 const clearBtn   = document.getElementById('clear-btn');
@@ -213,20 +423,14 @@ function log(msg, cls='') {
   logEl.scrollTop = logEl.scrollHeight;
 }
 
-function fmt(bytes) {
-  if (bytes < 1024) return bytes + ' B';
-  if (bytes < 1048576) return (bytes/1024).toFixed(1) + ' KB';
-  return (bytes/1048576).toFixed(1) + ' MB';
+function fmt(b) {
+  return b < 1048576 ? (b/1024).toFixed(1)+' KB' : (b/1048576).toFixed(1)+' MB';
 }
 
 function updateStatus() {
-  const total = files.length;
-  const done  = files.filter(f => f.status === 'done').length;
-  const errs  = files.filter(f => f.status === 'error').length;
-  statusLine.textContent = total === 0
-    ? 'No files loaded.'
-    : `${total} file(s) · ${done} converted · ${errs} error(s)`;
-  progressEl.style.width = total ? (done / total * 100) + '%' : '0%';
+  const total = files.length, done = files.filter(f=>f.status==='done').length, errs = files.filter(f=>f.status==='error').length;
+  statusLine.textContent = total===0 ? 'No files loaded.' : `${total} file(s) · ${done} converted · ${errs} error(s)`;
+  progressEl.style.width = total ? (done/total*100)+'%' : '0%';
   dlAllBtn.disabled = done === 0;
 }
 
@@ -235,55 +439,44 @@ function renderQueue() {
   files.forEach((f, i) => {
     const row = document.createElement('div');
     row.className = 'file-row ' + f.status;
+    const statusClass = f.status==='done'?'ok':f.status==='error'?'err':f.status==='processing'?'proc':'';
+    const statusText  = f.status==='pending'?'–':f.status==='processing'?'converting…':f.status==='done'?'✓ IATA XML':'✗ error';
     row.innerHTML = `
       <span class="file-name">${f.name}</span>
-      <span class="file-size">${fmt(f.size)}</span>
-      <span class="file-status ${f.status==='done'?'ok':f.status==='error'?'err':f.status==='processing'?'proc':''}">
-        ${f.status==='pending'?'–':f.status==='processing'?'converting…':f.status==='done'?'✓ done':'✗ error'}
-      </span>
+      <span class="file-meta">${fmt(f.size)}</span>
+      ${f.chargeCode ? `<span class="file-meta" style="color:var(--accent)">${f.chargeCode}</span>` : ''}
+      <span class="file-status ${statusClass}">${statusText}</span>
       ${f.status==='done' ? `<button class="dl-btn" data-i="${i}">Download XML</button>` : ''}
-      <button class="rm-btn" data-rm="${i}" title="Remove">✕</button>
+      <button class="rm-btn" data-rm="${i}">✕</button>
     `;
     queueEl.appendChild(row);
   });
-  queueEl.querySelectorAll('.dl-btn').forEach(b =>
-    b.addEventListener('click', () => downloadOne(+b.dataset.i)));
-  queueEl.querySelectorAll('.rm-btn').forEach(b =>
-    b.addEventListener('click', () => { files.splice(+b.dataset.rm, 1); renderQueue(); updateStatus(); convertBtn.disabled = files.length===0; }));
+  queueEl.querySelectorAll('.dl-btn').forEach(b => b.addEventListener('click', ()=>downloadOne(+b.dataset.i)));
+  queueEl.querySelectorAll('.rm-btn').forEach(b => b.addEventListener('click', ()=>{
+    files.splice(+b.dataset.rm, 1); renderQueue(); updateStatus(); convertBtn.disabled = files.length===0;
+  }));
   updateStatus();
 }
 
-// Prevent browser from opening dropped files globally
+// Block browser from opening PDF on drop
 document.addEventListener('dragover', e => e.preventDefault());
-document.addEventListener('drop', e => e.preventDefault());
+document.addEventListener('drop',     e => e.preventDefault());
 
-// Dropzone — highlight on drag enter/over
 dropzone.addEventListener('dragenter', e => { e.preventDefault(); e.stopPropagation(); dropzone.classList.add('drag-over'); });
 dropzone.addEventListener('dragover',  e => { e.preventDefault(); e.stopPropagation(); dropzone.classList.add('drag-over'); });
 dropzone.addEventListener('dragleave', e => { e.stopPropagation(); dropzone.classList.remove('drag-over'); });
 dropzone.addEventListener('drop', e => {
-  e.preventDefault();
-  e.stopPropagation();
+  e.preventDefault(); e.stopPropagation();
   dropzone.classList.remove('drag-over');
-  const dropped = [...e.dataTransfer.files];
-  log(`Dropped ${dropped.length} file(s)`, 'info');
-  addFiles(dropped);
+  addFiles([...e.dataTransfer.files]);
 });
-
-// Click to browse — only trigger when clicking the dropzone itself, not child elements
-dropzone.addEventListener('click', e => {
-  fileInput.click();
-});
-
-fileInput.addEventListener('change', () => {
-  addFiles([...fileInput.files]);
-  fileInput.value = '';
-});
+dropzone.addEventListener('click', () => fileInput.click());
+fileInput.addEventListener('change', () => { addFiles([...fileInput.files]); fileInput.value=''; });
 
 function addFiles(newFiles) {
   newFiles.filter(f => f.name.toLowerCase().endsWith('.pdf')).forEach(f => {
-    if (!files.find(x => x.name === f.name && x.size === f.size))
-      files.push({ file: f, name: f.name, size: f.size, status: 'pending', xmlBlob: null });
+    if (!files.find(x => x.name===f.name && x.size===f.size))
+      files.push({ file: f, name: f.name, size: f.size, status: 'pending', xmlBlob: null, chargeCode: null });
   });
   renderQueue();
   convertBtn.disabled = files.length === 0;
@@ -294,18 +487,18 @@ async function convertAll() {
   for (let i = 0; i < files.length; i++) {
     const f = files[i];
     if (f.status === 'done') continue;
-    f.status = 'processing';
-    renderQueue();
+    f.status = 'processing'; renderQueue();
     log(`Converting ${f.name}…`, 'info');
     try {
       const fd = new FormData();
       fd.append('file', f.file, f.name);
-      const res = await fetch('/convert', { method: 'POST', body: fd });
+      const res  = await fetch('/convert', { method: 'POST', body: fd });
       const data = await res.json();
       if (!res.ok || data.error) throw new Error(data.error || 'Server error');
-      f.xmlBlob = new Blob([data.xml], { type: 'application/xml' });
-      f.status = 'done';
-      log(`✓ ${f.name} converted (${data.pages} page(s))`, 'ok');
+      f.xmlBlob   = new Blob([data.xml], { type: 'application/xml' });
+      f.chargeCode = data.charge_code;
+      f.status    = 'done';
+      log(`✓ ${f.name} → IATA IS-XML [${data.charge_code}] inv#${data.invoice_number}`, 'ok');
     } catch(e) {
       f.status = 'error';
       log(`✗ ${f.name}: ${e.message}`, 'err');
@@ -320,24 +513,20 @@ function downloadOne(i) {
   if (!f.xmlBlob) return;
   const a = document.createElement('a');
   a.href = URL.createObjectURL(f.xmlBlob);
-  a.download = f.name.replace(/\.pdf$/i, '.xml');
+  a.download = f.name.replace(/\.pdf$/i, '_IATA.xml');
   a.click();
 }
 
 async function downloadAll() {
   for (let i = 0; i < files.length; i++) {
-    if (files[i].status === 'done') {
-      downloadOne(i);
-      await new Promise(r => setTimeout(r, 400));
-    }
+    if (files[i].status === 'done') { downloadOne(i); await new Promise(r=>setTimeout(r,400)); }
   }
 }
 
 convertBtn.addEventListener('click', convertAll);
 dlAllBtn.addEventListener('click', downloadAll);
 clearBtn.addEventListener('click', () => {
-  files.length = 0; renderQueue(); convertBtn.disabled = true;
-  log('Queue cleared.', 'info');
+  files.length = 0; renderQueue(); convertBtn.disabled = true; log('Queue cleared.', 'info');
 });
 </script>
 </body>
@@ -359,16 +548,20 @@ def convert():
         return jsonify({"error": "Not a PDF"}), 400
     try:
         pdf_bytes = f.read()
-        xml_str = pdf_bytes_to_xml(pdf_bytes, f.filename)
-        # count pages
-        with pdfplumber.open(io.BytesIO(pdf_bytes)) as pdf:
-            pages = len(pdf.pages)
-        return jsonify({"xml": xml_str, "pages": pages})
+        fields    = extract_invoice_fields(pdf_bytes)
+        xml_str   = build_iata_xml(fields, f.filename)
+        return jsonify({
+            "xml":            xml_str,
+            "charge_code":    fields["charge_code"],
+            "invoice_number": fields["inv_number"],
+            "currency":       fields["currency"],
+        })
     except Exception as e:
-        return jsonify({"error": str(e)}), 500
+        import traceback
+        return jsonify({"error": str(e), "trace": traceback.format_exc()}), 500
 
 
-# ── Entry point ──────────────────────────────────────────────────────────────
+# ── Entry point ───────────────────────────────────────────────────────────────
 
 if __name__ == "__main__":
     port = int(os.environ.get("PORT", 8080))
