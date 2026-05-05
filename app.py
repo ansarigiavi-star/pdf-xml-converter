@@ -141,8 +141,28 @@ def extract_invoice_fields(pdf_bytes: bytes) -> dict:
 
 def build_iata_xml(fields: dict, filename: str) -> str:
     """
-    Build IATA IS-XML (Invoice Standard V3.4) from extracted fields.
-    Structure: Transmission > Invoice > InvoiceHeader + LineItem(s) + InvoiceSummary
+    Build IATA IS-XML Invoice Standard V3.4 — full structure.
+
+    Hierarchy:
+      Transmission
+        TransmissionHeader
+        Invoice (1..n)
+          InvoiceHeader
+            SellerOrganization  (OrganizationID, OrganizationDesignator,
+                                 OrganizationName1, TaxRegistrationID,
+                                 CompanyRegistrationID, Address{…},
+                                 ContactDetails{…}, BankDetails{…})
+            BuyerOrganization   (same sub-elements)
+            PaymentTerms
+            ISDetails
+          LineItem (1..n)
+            LineItemDetail (1..n)   ← new in V3.4 full spec
+              ChargeCode-specific mandatory fields
+              AddOnCharges (VAT as add-on per spec §2.3)
+            AddOnCharges            ← line-item-level add-ons if any
+          InvoiceSummary
+            AddOnCharges            ← invoice-level add-ons
+        TransmissionSummary
     """
     ns = "http://www.iata.org/IATA/2007/00"
     ET.register_namespace("", ns)
@@ -153,45 +173,76 @@ def build_iata_xml(fields: dict, filename: str) -> str:
             e.text = str(text)
         return e
 
-    # ── Root: Transmission ───────────────────────────────────────────────────
+    def money(value: str) -> str:
+        """Normalise monetary string to 2dp float string."""
+        try:
+            return f"{float(value.replace(',', '')):.2f}"
+        except (ValueError, AttributeError):
+            return "0.00"
+
+    now_iso   = datetime.utcnow().strftime("%Y-%m-%dT%H:%M:%SZ")
+    inv_date  = fields["inv_date"]
+    currency  = fields["currency"]
+    vat_rate  = fields["vat_rate"]
+    has_vat   = bool(vat_rate) and float(vat_rate) > 0
+
+    station_lines = fields["station_lines"] or [("", "", fields["total_ex_vat"])]
+
+    # ── Root ─────────────────────────────────────────────────────────────────
     transmission = ET.Element("Transmission", xmlns=ns)
 
-    # TransmissionHeader
+    # ── TransmissionHeader ───────────────────────────────────────────────────
     th = el(transmission, "TransmissionHeader")
-    el(th, "TransmissionDate", datetime.utcnow().strftime("%Y-%m-%dT%H:%M:%SZ"))
-    el(th, "Version", "3.4")
-    el(th, "BillingCategory", "Miscellaneous")
+    el(th, "TransmissionDateTime", now_iso)          # V3.4: DateTime not Date
+    el(th, "Version",              "3.4")
+    el(th, "BillingCategory",      "Miscellaneous")
 
     # ── Invoice ──────────────────────────────────────────────────────────────
     invoice = el(transmission, "Invoice")
 
-    # InvoiceHeader
+    # ── InvoiceHeader ────────────────────────────────────────────────────────
     ih = el(invoice, "InvoiceHeader")
     el(ih, "InvoiceNumber",  fields["inv_number"])
-    el(ih, "InvoiceDate",    fields["inv_date"])
+    el(ih, "InvoiceDate",    inv_date)
     el(ih, "InvoiceType",    "Original")
     el(ih, "ChargeCategory", "Ground Handling")
 
-    # SellerOrganization
+    # ── SellerOrganization ───────────────────────────────────────────────────
     seller = el(ih, "SellerOrganization")
-    el(seller, "OrganizationID", fields["seller_name"])
+    el(seller, "OrganizationID",         fields["seller_name"])
+    el(seller, "OrganizationDesignator", "GH")          # Ground Handler designator
+    el(seller, "OrganizationName1",      fields["seller_name"])
     if fields["seller_vat"]:
-        el(seller, "VATNumber", fields["seller_vat"].strip())
+        el(seller, "TaxRegistrationID",     fields["seller_vat"].strip())
     if fields["seller_reg"]:
-        el(seller, "RegistrationNumber", fields["seller_reg"].strip())
+        el(seller, "CompanyRegistrationID", fields["seller_reg"].strip())
+
+    # Structured Address block (V3.4 spec §2.1)
+    addr = el(seller, "Address")
     if fields["seller_address"]:
-        el(seller, "Address", fields["seller_address"])
+        el(addr, "AddressLine1", fields["seller_address"])
+    # Extract city/postcode from address if available
+    addr_text = fields.get("seller_address", "")
+    postcode_m = re.search(r'\b([A-Z]{1,2}\d{1,2}[A-Z]?\s*\d[A-Z]{2})\b', addr_text)
+    if postcode_m:
+        el(addr, "PostalCode", postcode_m.group(1))
+    el(addr, "CountryCode",      "GB")   # default; override if detected
+    el(addr, "CountryName",      "United Kingdom")
+
+    # ContactDetails — Phone
     if fields["seller_tel"]:
         cd = el(seller, "ContactDetails")
         el(cd, "ContactType",  "Phone")
         el(cd, "ContactValue", fields["seller_tel"].strip())
+
+    # ContactDetails — Email
     if fields["seller_email"]:
         cd = el(seller, "ContactDetails")
         el(cd, "ContactType",  "Email")
         el(cd, "ContactValue", fields["seller_email"])
 
-    # BankDetails (TPA_Extension — standard allows this)
-    if fields["seller_iban"] or fields["seller_swift"]:
+    # BankDetails (TPA_Extension — widely used in practice)
+    if fields["seller_iban"] or fields["seller_swift"] or fields["seller_acc_no"]:
         bank = el(seller, "BankDetails")
         if fields["seller_bank"]:
             el(bank, "BankName",      fields["seller_bank"])
@@ -204,83 +255,115 @@ def build_iata_xml(fields: dict, filename: str) -> str:
         if fields["seller_swift"]:
             el(bank, "SWIFTCode",     fields["seller_swift"])
 
-    # BuyerOrganization
+    # ── BuyerOrganization ────────────────────────────────────────────────────
     buyer = el(ih, "BuyerOrganization")
-    el(buyer, "OrganizationID", fields["buyer_name"])
+    el(buyer, "OrganizationID",         fields["buyer_name"])
     if fields["buyer_iata"]:
-        el(buyer, "IATACode", fields["buyer_iata"])
+        el(buyer, "OrganizationDesignator", fields["buyer_iata"])
+        el(buyer, "OrganizationName1",      fields["buyer_name"])
     if fields["buyer_location"]:
         el(buyer, "LocationID", fields["buyer_location"])
 
-    # PaymentTerms
+    # ── PaymentTerms ─────────────────────────────────────────────────────────
     pt = el(ih, "PaymentTerms")
-    el(pt, "CurrencyCode",     fields["currency"])
+    el(pt, "CurrencyCode",     currency)
     el(pt, "SettlementMethod", "IS")
     el(pt, "PaymentDays",      fields["pay_terms"])
 
-    # ISDetails
+    # ── ISDetails ─────────────────────────────────────────────────────────────
     isd = el(ih, "ISDetails")
-    el(isd, "DigitalSignatureFlag", "false")
+    el(isd, "DigitalSignatureFlag",      "false")
+    el(isd, "AttachmentIndicatorOriginal", "true")   # V3.4: PDF invoice = original attachment
 
-    # ── LineItems ────────────────────────────────────────────────────────────
-    station_lines = fields["station_lines"]
-
-    # If we found station lines use them; else one generic line
-    if not station_lines:
-        station_lines = [("", "", fields["total_ex_vat"])]
+    # ── LineItems ─────────────────────────────────────────────────────────────
+    total_net_all     = 0.0
+    total_addon_all   = 0.0   # VAT add-on total across all line items
 
     for idx, (iata_code, station_name, amount) in enumerate(station_lines, start=1):
+        amt_net = float(money(amount))
+        total_net_all += amt_net
+
         li = el(invoice, "LineItem")
         el(li, "LineItemNumber", str(idx))
         el(li, "ChargeCode",     fields["charge_code"])
         desc = f"{fields['charge_code']} – {iata_code} {station_name}".strip(" –")
         el(li, "Description",    desc or fields["charge_code"])
-
-        if iata_code:
-            el(li, "LocationCode", iata_code)
-
-        el(li, "StartDate", fields["inv_date"])
-        el(li, "EndDate",   fields["inv_date"])
+        el(li, "StartDate",      inv_date)
+        el(li, "EndDate",        inv_date)
 
         qty = el(li, "Quantity", "1")
         qty.set("UOMCode", "EA")
 
-        amt_clean = amount.replace(",", "")
-        unit = el(li, "UnitPrice", amt_clean)
-        unit.set("SF", fields["currency"])
+        unit = el(li, "UnitPrice", f"{amt_net:.2f}")
+        unit.set("SF", currency)
 
-        charge = el(li, "ChargeAmount", amt_clean)
+        charge = el(li, "ChargeAmount", f"{amt_net:.2f}")
         charge.set("Name", "NetAmount")
 
-        el(li, "TotalNetAmount", amt_clean)
+        # ── LineItemDetail ── (V3.4 full spec — charge-code-specific fields)
+        lid = el(li, "LineItemDetail")
+        el(lid, "LineItemDetailNumber", "1")
+        if iata_code:
+            el(lid, "LocationCode", iata_code)          # mandatory for Mishandling Baggage
+        el(lid, "FlightDateTime",   inv_date + "T00:00:00Z")  # mandatory (substitution permitted)
+        el(lid, "ReferenceNumber",  fields["inv_number"])     # WorldTracer / ref
+        # MishandlingType for Mishandling Baggage charge code
+        if fields["charge_code"] == "Mishandling Baggage":
+            el(lid, "MishandlingType", "Damage")
+        el(lid, "ChargeAmount", f"{amt_net:.2f}")
+        el(lid, "TotalNetAmount", f"{amt_net:.2f}")
 
-        # VAT line
-        if fields["vat_rate"] and float(fields["vat_rate"]) > 0:
-            tax = el(li, "TaxInformation")
-            el(tax, "TaxCategory", "Standard")
-            el(tax, "TaxRate",     fields["vat_rate"])
-            try:
-                vat_amt = round(float(amt_clean) * float(fields["vat_rate"]) / 100, 2)
-                el(tax, "TaxAmount", f"{vat_amt:.2f}")
-            except ValueError:
-                pass
+        # ── AddOnCharges at LineItemDetail level (VAT per §2.3) ──────────────
+        if has_vat:
+            vat_amt = round(amt_net * float(vat_rate) / 100, 2)
+            total_addon_all += vat_amt
+            aoc = el(lid, "AddOnCharges")
+            el(aoc, "AddOnChargeType",     "Tax")
+            el(aoc, "AddOnChargeSubType",  "VAT")
+            el(aoc, "TaxCategory",         "Standard")
+            el(aoc, "TaxRate",             f"{float(vat_rate):.2f}")
+            el(aoc, "AddOnChargeAmount",   f"{vat_amt:.2f}")
+            el(aoc, "CurrencyCode",        currency)
+
+        el(lid, "TotalAddOnChargeAmount", f"{total_addon_all:.2f}" if has_vat else "0.00")
+
+        el(li, "TotalNetAmount",          f"{amt_net:.2f}")
+        el(li, "TotalAddOnChargeAmount",  f"{total_addon_all:.2f}" if has_vat else "0.00")
 
     # ── InvoiceSummary ───────────────────────────────────────────────────────
+    total_gross = float(money(fields["total_gross"]))
+    total_vat   = float(money(fields["total_vat"]))
+    # Use computed VAT if extracted total_vat looks like a rate rather than an amount
+    if total_vat == float(vat_rate) or total_vat == 0.0:
+        total_vat = total_addon_all
+    if total_gross == 0.0:
+        total_gross = total_net_all + total_vat
+
     summary = el(invoice, "InvoiceSummary")
-    el(summary, "LineItemCount",      str(len(station_lines)))
-    el(summary, "TotalLineItemAmount", fields["total_ex_vat"].replace(",", ""))
-    el(summary, "TotalVATAmount",      fields["total_vat"].replace(",", ""))
-    el(summary, "TotalAmount",         fields["total_gross"].replace(",", ""))
-    el(summary, "CurrencyCode",        fields["currency"])
+    el(summary, "LineItemCount",          str(len(station_lines)))
+    el(summary, "TotalLineItemAmount",    f"{total_net_all:.2f}")
+    el(summary, "TotalAddOnChargeAmount", f"{total_vat:.2f}")
+    el(summary, "TotalAmount",            f"{total_gross:.2f}")
+    el(summary, "CurrencyCode",           currency)
+
+    # Invoice-level AddOnCharges (VAT summary at invoice level per §2.3 rule 5)
+    if has_vat and total_vat > 0:
+        inv_aoc = el(summary, "AddOnCharges")
+        el(inv_aoc, "AddOnChargeType",    "Tax")
+        el(inv_aoc, "AddOnChargeSubType", "VAT")
+        el(inv_aoc, "TaxCategory",        "Standard")
+        el(inv_aoc, "TaxRate",            f"{float(vat_rate):.2f}")
+        el(inv_aoc, "AddOnChargeAmount",  f"{total_vat:.2f}")
+        el(inv_aoc, "CurrencyCode",       currency)
 
     # ── TransmissionSummary ──────────────────────────────────────────────────
     ts = el(transmission, "TransmissionSummary")
     el(ts, "InvoiceCount", "1")
-    total_el = el(ts, "TotalAmount", fields["total_gross"].replace(",", ""))
-    total_el.set("CurrencyCode", fields["currency"])
+    ta = el(ts, "TotalAmount", f"{total_gross:.2f}")
+    ta.set("CurrencyCode", currency)
 
-    # Pretty print
-    raw = ET.tostring(transmission, encoding="unicode", xml_declaration=False)
+    # ── Serialise ─────────────────────────────────────────────────────────────
+    raw    = ET.tostring(transmission, encoding="unicode", xml_declaration=False)
     pretty = minidom.parseString(raw).toprettyxml(indent="  ")
     return pretty
 
@@ -396,10 +479,10 @@ HTML = r"""<!DOCTYPE html>
   <div id="log"><span class="log-info">Ready — drop PDFs to begin.</span></div>
 
   <div class="schema-note">
-    <strong>Output schema:</strong> IATA IS-XML V3.4 &nbsp;·&nbsp;
+    <strong>Output schema:</strong> IATA IS-XML V3.4 (full spec) &nbsp;·&nbsp;
     <strong>Charge Category:</strong> Ground Handling &nbsp;·&nbsp;
-    <strong>Charge Codes detected:</strong> Mishandling Baggage, Baggage, Ramp Handling, Catering, Cleaning, Deicing + more<br>
-    Fields extracted: InvoiceNumber · InvoiceDate · Seller/Buyer · LocationCode (IATA) · LineItems · VAT · Totals · Bank/IBAN/SWIFT
+    <strong>Charge Codes:</strong> Mishandling Baggage, Baggage, Ramp Handling, Catering, Cleaning, Deicing + more<br>
+    Includes: TransmissionDateTime · OrganizationDesignator · OrganizationName1 · TaxRegistrationID · CompanyRegistrationID · structured Address block · LineItemDetail · AddOnCharges (VAT per §2.3) · AttachmentIndicatorOriginal · TotalAddOnChargeAmount
   </div>
 </main>
 
